@@ -5,5 +5,5 @@ litellm==1.75.9
 smartcomment>=0.1.1
 sortedcontainers>=2.4.0
 agentscope<2.0.0
-huggingface-hub
+huggingface-hub>=1.14.0
 nltk>=3.9.4
