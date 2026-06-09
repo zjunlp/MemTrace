@@ -373,6 +373,354 @@ def _format_source_evidence(nodes: list[RuntimeVariable[Any]]) -> str:
     return "\n\n".join(chunks)
 
 
+def _tokenize(text: str) -> list[str]:
+    """Tokenize text for lightweight lexical (BM25) retrieval.
+
+    Args:
+        text (`str`):
+            The input text.
+
+    Returns:
+        `list[str]`:
+            A token list containing English word tokens.
+    """
+    lowered = text.lower()
+    return re.findall(r"[a-z0-9_]+", lowered)
+
+
+def _rrf_fuse(
+    ranked_lists: list[list[str]],
+    rrf_k: int = 60,
+) -> list[tuple[str, float]]:
+    """Fuse multiple ranked lists with Reciprocal Rank Fusion (RRF).
+
+    Args:
+        ranked_lists (`list[list[str]]`):
+            Multiple ranked lists of document identifiers.
+        rrf_k (`int`, defaults to `60`):
+            The RRF smoothing constant used in RRF.
+
+    Returns:
+        `list[tuple[str, float]]`:
+            A list of tuples containing the document identifier and the 
+            corresponding score.    
+    """
+    scores = {}
+    best_rank = {}
+    for ranked in ranked_lists:
+        for rank, doc_id in enumerate(ranked, start=1):
+            scores[doc_id] = scores.get(doc_id, 0.0) + 1.0 / (rrf_k + rank)
+            if doc_id not in best_rank or rank < best_rank[doc_id]:
+                best_rank[doc_id] = rank
+    return sorted(
+        scores.items(),
+        key=lambda item: (-item[1], best_rank[item[0]], item[0]),
+    )
+
+
+class DocumentRetriever(SimpleKnowledge):
+    """A general-purpose document retriever over a fixed document collection."""
+
+    def __init__(
+        self,
+        embedding_model_name: str = "text-embedding-3-small",
+        embedding_dimensions: int = 1536,
+        embedding_base_url: str | None = None,
+        embedding_api_key: str | None = None,
+        embedding_batch_size: int = 16,
+        retrieval_type: Literal["sparse", "dense", "hybrid"] = "hybrid",
+        candidate_multiplier: int = 2,
+    ) -> None:
+        """Initialize the retrieval module and set up the configured indexes.
+
+        Args:
+            embedding_model_name (`str`, defaults to `"text-embedding-3-small"`):
+                The OpenAI-compatible embedding model name. It will be ignored 
+                if the retrieval type is ``"sparse"``.
+            embedding_dimensions (`int`, defaults to `1536`):
+                The dimensionality of the embedding vectors. It will be ignored 
+                if the retrieval type is ``"sparse"``.
+            embedding_base_url (`str | None`, optional):
+                The base URL for the OpenAI-compatible embedding endpoint. If
+                not provided, it falls back to ``OPENAI_BASE_URL`` or ``OPENAI_API_BASE`` 
+                environment variables. It will be ignored if the retrieval type is ``"sparse"``.
+            embedding_api_key (`str | None`, optional):
+                The API key for the OpenAI-compatible embedding endpoint. If not
+                provided, it falls back to the ``OPENAI_API_KEY`` environment
+                variable. It will be ignored if the retrieval type is ``"sparse"``.
+            embedding_batch_size (`int`, defaults to `16`):
+                The number of documents embedded per request when building the
+                dense index. It will be ignored if the retrieval type is ``"sparse"``.
+            retrieval_type (`Literal["sparse", "dense", "hybrid"]`, defaults to `"hybrid"`):
+                The retrieval strategy used to build the index.
+            candidate_multiplier (`int`, defaults to `2`):
+                It is only used for hybrid retrieval. Before fusing the results,
+                the sparse and dense retrievers each fetch this many times as
+                many candidates as the number of documents finally returned, so
+                that the fusion has a larger pool to work with.
+        """
+        if retrieval_type not in ("sparse", "dense", "hybrid"):
+            raise ValueError(
+                "`retrieval_type` must be one of 'sparse', 'dense', or 'hybrid'."
+            )
+        if candidate_multiplier < 1:
+            raise ValueError("`candidate_multiplier` must be greater than or equal to 1.")
+        if embedding_batch_size < 1:
+            raise ValueError("`embedding_batch_size` must be greater than or equal to 1.")
+
+        self._candidate_multiplier = candidate_multiplier
+        self._embedding_batch_size = embedding_batch_size
+
+        embedding_model = embedding_store = None
+        if retrieval_type in ("dense", "hybrid"):
+            api_key = embedding_api_key or os.environ.get("OPENAI_API_KEY")
+            if api_key is None:
+                raise ValueError(
+                    "An embedding API key is required for dense retrieval. "
+                    "Provide `embedding_api_key` or set `OPENAI_API_KEY`."
+                )
+            base_url = (
+                embedding_base_url
+                or os.environ.get("OPENAI_BASE_URL")
+                or os.environ.get("OPENAI_API_BASE")
+            )
+            client_kwargs = {}
+            if base_url is not None:
+                client_kwargs["base_url"] = base_url
+            embedding_model = OpenAITextEmbedding(
+                api_key=api_key,
+                model_name=embedding_model_name,
+                dimensions=embedding_dimensions,
+                **client_kwargs,
+            )
+            embedding_store = QdrantStore(
+                location=":memory:",
+                collection_name="documents",
+                dimensions=embedding_dimensions,
+            )
+        super().__init__(
+            embedding_store=embedding_store,
+            embedding_model=embedding_model,
+        )
+
+        # The canonical document store keyed by the document identifier, used to
+        # return the original documents.
+        self._documents = {}
+        # The BM25 index is rebuilt from this corpus on every change.
+        self._bm25_corpus = (
+            [] if retrieval_type in ("sparse", "hybrid") else None
+        )
+        self._bm25 = None
+
+    @property
+    def retrieval_type(self) -> Literal["sparse", "dense", "hybrid"]:
+        """Return the effective retrieval type.
+
+        Returns:
+            `Literal["sparse", "dense", "hybrid"]`:
+                The effective retrieval type.
+        """
+        has_sparse = self._bm25_corpus is not None
+        has_dense = self.embedding_store is not None
+        if has_sparse and has_dense:
+            return "hybrid"
+        if has_dense:
+            return "dense"
+        return "sparse"
+
+    async def add_documents(self, documents: list[Document], **kwargs: Any) -> None:
+        """Add documents to the configured indexes.
+
+        Args:
+            documents (`list[Document]`):
+                The documents to add. Each document's identity is read from
+                its metadata.
+            **kwargs (`Any`):
+                Additional keyword arguments forwarded to the embedding model.
+        """
+        if not documents:
+            return
+
+        valid_documents = []
+        for doc in documents:
+            text = doc.metadata.content["text"]
+            if not text or not text.strip():
+                warnings.warn(
+                    f"Document '{doc.metadata.doc_id}' has empty content and is skipped.",
+                    UserWarning,
+                )
+                continue
+            valid_documents.append(doc)
+        if not valid_documents:
+            return
+
+        for doc in valid_documents:
+            self._documents[doc.metadata.doc_id] = doc
+
+        if self._bm25_corpus is not None:
+            self._bm25_corpus.extend(
+                (doc.metadata.doc_id, _tokenize(doc.metadata.content["text"]))
+                for doc in valid_documents
+            )
+            self._bm25 = BM25Okapi([tokens for _, tokens in self._bm25_corpus])
+
+        if self.embedding_store is not None:
+            for start in range(0, len(valid_documents), self._embedding_batch_size):
+                batch = valid_documents[start:start + self._embedding_batch_size]
+                res_embeddings = await self.embedding_model(
+                    [doc.metadata.content for doc in batch],
+                    **kwargs,
+                )
+                for doc, embedding in zip(batch, res_embeddings.embeddings):
+                    doc.embedding = embedding
+            await self.embedding_store.add(valid_documents)
+
+    def _sparse_scores(
+        self,
+        query: str,
+        limit: int = 10,
+        score_threshold: float | None = None,
+    ) -> list[tuple[str, float]]:
+        """Retrieve candidates via sparse retrieval.
+
+        Args:
+            query (`str`):
+                The retrieval query.
+            limit (`int`, defaults to `10`):
+                The maximum number of candidates to return.
+            score_threshold (`float | None`, optional):
+                The score threshold used to filter the candidates.
+
+        Returns:
+            `list[tuple[str, float]]`:
+                A list of tuples containing the document identifier and the 
+                corresponding score.
+        """
+        if self._bm25 is None:
+            return []
+        doc_ids = [doc_id for doc_id, _ in self._bm25_corpus]
+        query_tokens = _tokenize(query)
+        if not query_tokens:
+            scores = [0.0] * len(doc_ids)
+        else:
+            scores = self._bm25.get_scores(query_tokens)
+
+        ranked = sorted(
+            ((doc_id, float(score)) for doc_id, score in zip(doc_ids, scores)),
+            key=lambda item: -item[1],
+        )
+        results = []
+        for doc_id, score in ranked:
+            if score_threshold is not None and score < score_threshold:
+                continue
+            results.append((doc_id, score))
+            if len(results) >= limit:
+                break
+        return results
+
+    async def _dense_scores(
+        self,
+        query: str,
+        limit: int = 10,
+        score_threshold: float | None = None,
+        **kwargs: Any,
+    ) -> list[tuple[str, float]]:
+        """Retrieve candidates via dense retrieval.
+
+        Args:
+            query (`str`):
+                The retrieval query.
+            limit (`int`, defaults to `10`):
+                The maximum number of candidates to return.
+            score_threshold (`float | None`, optional):
+                The embedding score threshold passed to the vector store.
+            **kwargs (`Any`):
+                Additional keyword arguments forwarded to the embedding model.
+
+        Returns:
+            `list[tuple[str, float]]`:
+                A list of tuples containing the document identifier and the 
+                corresponding score.
+        """
+        res_embedding = await self.embedding_model(
+            [TextBlock(type="text", text=query)],
+            **kwargs,
+        )
+        res = await self.embedding_store.search(
+            res_embedding.embeddings[0],
+            limit=limit,
+            score_threshold=score_threshold,
+        )
+        return [(doc.metadata.doc_id, float(doc.score)) for doc in res]
+
+    async def retrieve(
+        self,
+        query: str,
+        limit: int = 10,
+        score_threshold: float | None = None,
+        **kwargs: Any,
+    ) -> list[Document]:
+        """Retrieve the top-K documents for the query.
+
+        Args:
+            query (`str`):
+                The retrieval query.
+            limit (`int`, defaults to `10`):
+                The number of documents to return.
+            score_threshold (`float | None`, optional):
+                The score threshold used to filter the results.
+            **kwargs (`Any`):
+                Additional keyword arguments forwarded to the embedding model.
+
+        Returns:
+            `list[Document]`:
+                The retrieved documents carrying the corresponding retrieval score.
+        """
+        retrieval_type = self.retrieval_type
+
+        if retrieval_type == "sparse":
+            ranked = self._sparse_scores(
+                query,
+                limit=limit,
+                score_threshold=score_threshold,
+            )
+        elif retrieval_type == "dense":
+            ranked = await self._dense_scores(
+                query,
+                limit=limit,
+                score_threshold=score_threshold,
+                **kwargs,
+            )
+        else:
+            # Hybrid retrieval: oversample each retriever without a per-retriever
+            # threshold, fuse with RRF, then filter the fused score by threshold.
+            candidate_limit = limit * self._candidate_multiplier
+            sparse_ranked = self._sparse_scores(query, limit=candidate_limit)
+            dense_ranked = await self._dense_scores(
+                query,
+                limit=candidate_limit,
+                **kwargs,
+            )
+            fused = _rrf_fuse(
+                [
+                    [doc_id for doc_id, _ in sparse_ranked],
+                    [doc_id for doc_id, _ in dense_ranked],
+                ]
+            )
+            ranked = []
+            for doc_id, score in fused:
+                if score_threshold is not None and score < score_threshold:
+                    continue
+                ranked.append((doc_id, score))
+                if len(ranked) >= limit:
+                    break
+
+        return [
+            replace(self._documents[doc_id], score=score)
+            for doc_id, score in ranked
+        ]
+
+
 class MemTraceRunner(AgentBaseRunner):
     """Runner that concurrently attributes failed memory-query cases."""
 
@@ -385,6 +733,62 @@ class MemTraceRunner(AgentBaseRunner):
                 default configuration is used.
         """
         super().__init__(config or MemTraceConfig())
+
+    def _cache_file_path(self, identifier: JsonValue) -> str | None:
+        """Resolve the cache file path for one identifier.
+
+        Args:
+            identifier (`JsonValue`):
+                The cache identifier.
+
+        Returns:
+            `str | None`:
+                If caching is enabled, it is the cache file path.
+        """
+        if self.config.cache_dir is None:
+            return None
+        os.makedirs(self.config.cache_dir, exist_ok=True)
+        json_str = json.dumps(identifier, sort_keys=True, ensure_ascii=False)
+        filename = hashlib.sha256(json_str.encode("utf-8")).hexdigest() + ".json"
+        return os.path.join(self.config.cache_dir, filename)
+
+    def _load_cached_case(self, identifier: JsonValue) -> JsonValue:
+        """Load a cached attribution case if it exists.
+
+        Args:
+            identifier (`JsonValue`):
+                The cache identifier.
+
+        Returns:
+            `JsonValue`:
+                If the case is cached, it is the cached payload with the 
+                error attribution result and the elapsed seconds.
+        """
+        path = self._cache_file_path(identifier)
+        if path is None or not os.path.exists(path):
+            return None
+        with open(path, "r", encoding="utf-8") as file:
+            return json.load(file)
+
+    def _store_cached_case(self, identifier: JsonValue, payload: JsonValue) -> None:
+        """Store one attributed case to the cache.
+
+        Args:
+            identifier (`JsonValue`):
+                The cache identifier.
+            payload (`JsonValue`):
+                The payload with the error attribution result and the elapsed seconds.
+        """
+        path = self._cache_file_path(identifier)
+        if path is None:
+            return
+        with open(path, "w", encoding="utf-8") as file:
+            json.dump(
+                payload, 
+                file, 
+                ensure_ascii=False, 
+                indent=4
+            )
 
     def _build_agent(
         self,
