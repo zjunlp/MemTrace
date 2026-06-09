@@ -179,7 +179,7 @@ CUDA_VISIBLE_DEVICES=0 vllm serve pretrained_models/Qwen3-Embedding-4B \
 
 ## Quick Example
 
-The snippet below loads one EverMemOS failed case from MemTraceBench, initializes a graph-trace notebook with its source evidence, and asks the agent how the memory system handles the failed question.
+The snippet below loads one Mem0 failed case from MemTraceBench, initializes a graph-trace notebook with its source evidence, and asks the agent how the memory system handles the failed question.
 
 Before running it, set your OpenAI-compatible credentials:
 
