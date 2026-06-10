@@ -368,6 +368,9 @@ After the run finishes, `--optimization-dir` (here `./outputs/memtrace_optimizat
 
 To measure how the optimized prompts affect end-task performance, evaluate Mem0 again with the [MemBase](https://github.com/zjunlp/MemBase/tree/main/examples/evaluate_mem0_on_locomo). Apply the optimized prompts as follows:
 
+> [!NOTE]
+> If you want to skip the automatic optimization process and directly reproduce Mem0's performance with the optimized prompts, use `input_files/update_results.json`. It contains the optimized prompt fields that would otherwise be read from the final optimization round's `iteration_3/update_results.json`.
+
 1. In that example's `mem0_config.json`, add the two fields `custom_fact_extraction_prompt` (copied from `fact-extraction-system-prompt@1` in `iteration_3/update_results.json`) and `custom_update_memory_prompt` (copied from `memory-update-decision-prompt@1`).
 2. For the question-answering prompt, edit the return value of the `get_mem0_qa_prompt` function in the example's `qa_prompt.py` so that it returns the prompt template given by `question-answering-prompt@1` in `iteration_3/update_results.json`.
 
