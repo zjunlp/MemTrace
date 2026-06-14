@@ -288,6 +288,7 @@ Useful options:
 
 - To use memory-system prior knowledge, add `--use-system-prior`.
 - To start from the annotated source evidence instead of retrieved pseudo evidence, use `--starting-nodes-type source_evidence`.
+- To use the search-based operation exploration strategy, set `--exploration-strategy operation_block_search`.
 - To change how MemTrace finds the initial evidence messages, set `--retrieval-type sparse`, `--retrieval-type dense`, or `--retrieval-type hybrid`. Use `--num-starting-points` to control how many starting evidence nodes are given to the agent, and `--candidate-multiplier` to let hybrid retrieval look at more candidates before selecting the final starting nodes.
 - To change the attribution model, set `--model-name YOUR_MODEL_NAME`.
 - To switch memory systems, replace `evermemos` with one of `rag`, `mem0`, `evermemos`, or `long_context`.
