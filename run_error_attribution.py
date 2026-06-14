@@ -78,6 +78,12 @@ def parse_args() -> argparse.Namespace:
         help="Append the split's memory-system prior knowledge to the instructions.",
     )
     parser.add_argument(
+        "--exploration-strategy",
+        choices=["graph_search", "operation_block_search"],
+        default="graph_search",
+        help="The strategy used to explore the execution graph.",
+    )
+    parser.add_argument(
         "--model-name",
         default="gpt-4.1-mini",
         help="OpenAI-compatible model name for the attribution agent.",
@@ -245,6 +251,7 @@ async def run(args: argparse.Namespace) -> dict:
         failed_cases = [case for _, case in selected]
 
     config = MemTraceConfig(
+        exploration_strategy=args.exploration_strategy,
         model=args.model_name,
         temperature=args.temperature,
         stream=args.stream,

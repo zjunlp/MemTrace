@@ -30,6 +30,7 @@ from graphtrace import (
     StudioServer,
     agentscope_token_monitor,
 )
+from obstrace import CCTraceNotebook, ObsTraceAttributionAgent
 from smartcomment.runtime import ExecNetwork
 from smartcomment.runtime.variable import RuntimeVariable
 from .bench_utils import FailedQueryCase
@@ -142,7 +143,61 @@ Error type definitions:
 """
 
 
+OBS_ATTRIBUTION_INSTRUCTIONS = """Your task is to inspect the execution trace and identify the earliest decisive faulty operation.
+
+Ideal memory-system behavior:
+- When a raw input containing critical information arrives, the memory construction stage should create or update memory-unit containers so that the critical information enters the memory store.
+- Later operations over a memory-unit container should preserve the critical information. They should not accidentally remove, overwrite, over-summarize, or degrade it during updates, consolidation, or deletion.
+- When a query requiring that critical information arrives, retrieval should surface memory units or context containing the needed information.
+- The downstream answer model should then use the retrieved context to answer the question correctly.
+- Compare the observed trace against this ideal behavior to decide where the first decisive break occurs.
+
+Definition of earliest decisive faulty operation:
+- An operation is faulty only if its outputs are wrong or insufficient for the role it is supposed to perform, given its operation name, category, comment, inputs, and available evidence at that point in the workflow.
+- Do not mark an operation faulty merely because it appears early or because a downstream failure can be traced back to one of its inputs. First decide whether the operation itself behaved incorrectly under its own local responsibility.
+- Decisive means that correcting this operation's faulty output, while keeping all strictly earlier operations unchanged and assuming ideal downstream behavior, would have prevented the final wrong answer.
+- Earliest means the first such locally faulty and decisive operation in execution order.
+
+Required reasoning checklist before returning the final answer:
+1. Identify the critical information needed to answer the question.
+2. Inspect candidate operations in execution order and decide whether each one is locally correct for its own function.
+3. If an operation is locally correct, continue downstream instead of labeling it as the error.
+4. Once the critical information enters a memory unit, do not stop at that operation. You must keep following downstream operations involving that memory unit and check whether the critical information remains present throughout the lifetime of the memory unit. If an operation causes this critical information to be transferred from one memory unit to another memory unit or to some intermediate variables, and the original memory unit no longer contains this information, then track the other memory unit or intermediate variables that contain this key information to ensure that there exists a memory unit that will hold this key information.
+5. If the critical information never enters any memory unit, label the responsible construction operation as ExtractionError.
+6. If the critical information enters a memory unit but a later operation removes or degrades it, label that later operation as UpdateError or DeletionError depending on whether it updates the unit or explicitly deletes it.
+7. For retrieval candidates, verify that the memory store contains the required information before retrieval, but the retrieval pipeline fails to include it in the final retrieved context.
+8. For response candidates, verify that the final retrieved context contains all necessary evidence and the answer model still answers incorrectly.
+
+Return exactly one error attribution using the required structured schema:
+- error_type: one of ExtractionError, UpdateError, DeletionError, RetrievalError, ResponseError.
+- op_id: the operation identifier of the earliest decisive faulty operation.
+- reason: a concise explanation grounded in trace evidence. The reason must state why the chosen operation is locally faulty, why correcting it would rescue the answer, and why earlier candidate operations are not the decisive fault when relevant.
+
+Error type definitions:
+- ExtractionError: The critical information is never captured into any memory unit during memory construction, and thus never enters the memory store.
+- UpdateError: A memory unit initially contains the critical information, but a subsequent update removes or degrades it.
+- DeletionError: A memory unit containing critical information is explicitly removed.
+- RetrievalError: The memory store contains the required information, but retrieval fails to include it in the final retrieved context.
+- ResponseError: The retrieved context contains all necessary evidence, but the final LLM still answers incorrectly.
+"""
+
+
 TASK_PROMPT_TEMPLATES = {
+    "operation_block_search": """You are performing failure attribution for a memory-based question-answering system.
+
+The execution trace is available through trace inspection tools. First inspect the relevant evidence before deciding on the earliest decisive fault.
+
+{instructions}
+
+Question:
+{question}
+
+Golden answer:
+{golden_answer}
+
+Model's wrong answer:
+{prediction}
+""",
     "with_source_evidence_initial_nodes": """You are performing failure attribution for a memory-based question-answering system.
 
 The execution graph has already been initialized with the query node and the source-evidence message nodes in the exploration frontier.
@@ -231,6 +286,10 @@ class ErrorAttributionPrediction(BaseModel):
 class MemTraceConfig(AgentBaseConfig):
     """The configuration for MemTrace."""
 
+    exploration_strategy: Literal["graph_search", "operation_block_search"] = Field(
+        default="graph_search",
+        description="The strategy used to explore the execution graph.",
+    )
     context_window: int = Field(
         default=272_000,
         description="The working context window size for the graph trace agent.",
@@ -838,6 +897,39 @@ class MemTraceRunner(AgentBaseRunner):
             ),
         )
 
+    def _build_obs_agent(
+        self,
+        notebook: CCTraceNotebook,
+        api_key: str,
+        base_url: str,
+    ) -> ObsTraceAttributionAgent:
+        """Build a flat operation-log attribution agent."""
+        cfg = self.config
+        model = OpenAIChatModel(
+            model_name=cfg.model,
+            api_key=api_key,
+            stream=cfg.stream,
+            client_kwargs={"base_url": base_url},
+            generate_kwargs={"temperature": cfg.temperature},
+        )
+        return ObsTraceAttributionAgent(
+            name="memtrace",
+            sys_prompt=(
+                "You are a careful execution-trace failure attribution agent. "
+                "Use the trace inspection tools to inspect evidence before answering."
+            ),
+            model=model,
+            formatter=OpenAIChatFormatter(),
+            cc_trace_notebook=notebook,
+            max_iters=cfg.max_iters,
+            compression_config=ObsTraceAttributionAgent.CompressionConfig(
+                enable=True,
+                agent_token_counter=OpenAITokenCounter(cfg.model),
+                trigger_threshold=cfg.context_window,
+                keep_recent=cfg.keep_recent,
+            ),
+        )
+
     def _build_task_prompt(
         self,
         case: FailedQueryCase,
@@ -873,6 +965,14 @@ class MemTraceRunner(AgentBaseRunner):
             `str`:
                 The attribution task prompt.
         """
+        if self.config.exploration_strategy == "operation_block_search":
+            return TASK_PROMPT_TEMPLATES["operation_block_search"].format(
+                instructions=OBS_ATTRIBUTION_INSTRUCTIONS,
+                question=case.query,
+                golden_answer=case.golden_answer,
+                prediction=case.prediction,
+            )
+
         instructions = ATTRIBUTION_INSTRUCTIONS
         if custom_prior_knowledge is not None:           
             instructions = f"{instructions}\n\n{custom_prior_knowledge}"
@@ -1067,6 +1167,7 @@ class MemTraceRunner(AgentBaseRunner):
                     for field in (
                         "model",
                         "temperature",
+                        "exploration_strategy",
                         "context_window",
                         "max_context_limit",
                         "keep_recent",
@@ -1116,25 +1217,36 @@ class MemTraceRunner(AgentBaseRunner):
                 else:
                     source_evidence_nodes = None
 
-                notebook = GraphTraceNotebook(
-                    graph,
-                    max_trace_nodes=self.config.max_trace_nodes,
-                    include_metadata=False,
-                )
-
-                if source_evidence_nodes is not None:
-                    initial_full_node_ids = [query_node.full_node_id]
-                    initial_full_node_ids.extend(
-                        node.full_node_id for node in source_evidence_nodes
-                    )
-                    _ = await notebook.initialize_execution_graph(initial_full_node_ids)
-
                 api_key, base_url = api_pool.credential_for(case_index)
-                agent = self._build_agent(
-                    notebook=notebook,
-                    api_key=api_key,
-                    base_url=base_url,
-                )
+                if self.config.exploration_strategy == "operation_block_search":
+                    notebook = CCTraceNotebook.from_graph(
+                        graph,
+                        source_evidence_nodes=source_evidence_nodes,
+                    )
+                    agent = self._build_obs_agent(
+                        notebook=notebook,
+                        api_key=api_key,
+                        base_url=base_url,
+                    )
+                else:
+                    notebook = GraphTraceNotebook(
+                        graph,
+                        max_trace_nodes=self.config.max_trace_nodes,
+                        include_metadata=False,
+                    )
+
+                    if source_evidence_nodes is not None:
+                        initial_full_node_ids = [query_node.full_node_id]
+                        initial_full_node_ids.extend(
+                            node.full_node_id for node in source_evidence_nodes
+                        )
+                        _ = await notebook.initialize_execution_graph(initial_full_node_ids)
+
+                    agent = self._build_agent(
+                        notebook=notebook,
+                        api_key=api_key,
+                        base_url=base_url,
+                    )
                 task_msg = Msg(
                     "user",
                     self._build_task_prompt(
