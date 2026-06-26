@@ -37,14 +37,20 @@ The current UI supports:
 
 At the top of the page, users can switch between different graphs discovered from a single JSON file or a dataset directory.
 
+![Graph selector](figures/graph_selector.png)
+
 ### 2. Global Wrong-QA Selector
 
 The `Query` selector jumps directly to the graph containing the selected wrong QA and synchronizes the left sidebar selection.
+
+![Global wrong-QA selector](figures/wrong_qa_selector.png)
 
 ### 3. Macro Flow Timeline
 
 The central timeline shows message-level flow in a boustrophedon layout.
 Clicking a thick edge opens the corresponding runtime construction subgraph on the right.
+
+![Macro flow timeline](figures/macro_flow.png)
 
 ### 4. QA Sidebar
 
@@ -55,13 +61,19 @@ The left sidebar supports:
 - opening error attribution for failed cases
 - jumping to evidence nodes
 
+![QA sidebar](figures/qa_sidebar.png)
+
 ### 5. Edge & Variable Subgraph
 
 The right-side detail panel renders the runtime construction subgraph of the currently selected macro edge.
 
+![Edge and variable subgraph](figures/edge_variable_subgraph.png)
+
 ### 6. Related Variable View
 
 Clicking a node inside the subgraph opens a 1-hop BFS view for the selected runtime variable.
+
+![Related variable view](figures/related_variable_view.png)
 
 ### 7. Error Attribution View
 
@@ -71,6 +83,8 @@ For wrong QA items, the app can run trace-based error attribution and render:
 - retrieval subgraph
 - response subgraph
 - manual annotation form for exporting attribution labels
+
+![Error attribution view](figures/error_attribution.png)
 
 ---
 
