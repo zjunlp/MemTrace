@@ -89,11 +89,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--max-op-xml-tokens",
         type=int,
-        default=100_000,
+        default=600_000,
         help=(
             "Maximum tokens retained from one attributed operation subgraph "
-            "XML. Oversized XML keeps the window nearest to the attributed "
-            "operation id."
+            "XML. Oversized XML keeps its last tokens."
         ),
     )
     parser.add_argument(
