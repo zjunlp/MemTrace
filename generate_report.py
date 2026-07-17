@@ -87,6 +87,16 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--max-op-xml-tokens",
+        type=int,
+        default=100_000,
+        help=(
+            "Maximum tokens retained from one attributed operation subgraph "
+            "XML. Oversized XML keeps the window nearest to the attributed "
+            "operation id."
+        ),
+    )
+    parser.add_argument(
         "--api-config-path",
         type=str,
         default=None,
@@ -187,6 +197,7 @@ async def run(args: argparse.Namespace) -> None:
         temperature=args.temperature,
         stream=True,
         batch_size=args.batch_size,
+        max_op_xml_tokens=args.max_op_xml_tokens,
         api_config_path=args.api_config_path,
         studio_url=args.studio_url,
         project=args.project,

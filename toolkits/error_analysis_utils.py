@@ -5,6 +5,7 @@ import os
 import warnings
 from collections import defaultdict
 from pathlib import Path
+import tiktoken
 from pydantic import BaseModel, Field
 from agentscope.agent import ReActAgent
 from agentscope.formatter import OpenAIChatFormatter
@@ -120,7 +121,52 @@ class _ErrorAnalysisReport(BaseModel):
     )
 
 
-def _render_op_subgraph_xml(graph: ExecNetwork, op_id: str) -> str:
+def _get_token_encoding(model_name: str) -> tiktoken.Encoding:
+    """Return the tokenizer used to budget report inputs."""
+    try:
+        return tiktoken.encoding_for_model(model_name)
+    except KeyError:
+        return tiktoken.get_encoding("o200k_base")
+
+
+def _truncate_tokens_around_marker(
+    text: str,
+    marker: str,
+    max_tokens: int,
+    encoding: tiktoken.Encoding,
+) -> tuple[str, int]:
+    """Keep the token window nearest to a marker in a long string."""
+    tokens = encoding.encode(text)
+    original_tokens = len(tokens)
+    if original_tokens <= max_tokens:
+        return text, original_tokens
+
+    marker_index = text.find(marker)
+    if marker_index < 0:
+        return encoding.decode(tokens[-max_tokens:]), original_tokens
+
+    before_tokens = encoding.encode(text[:marker_index])
+    after_tokens = encoding.encode(text[marker_index:])
+    before_budget = min(len(before_tokens), max_tokens // 2)
+    after_budget = min(len(after_tokens), max_tokens - before_budget)
+
+    remaining = max_tokens - before_budget - after_budget
+    if remaining > 0:
+        extra_before = min(len(before_tokens) - before_budget, remaining)
+        before_budget += extra_before
+        remaining -= extra_before
+        after_budget += min(len(after_tokens) - after_budget, remaining)
+
+    retained = before_tokens[-before_budget:] + after_tokens[:after_budget]
+    return encoding.decode(retained), original_tokens
+
+
+def _render_op_subgraph_xml(
+    graph: ExecNetwork,
+    op_id: str,
+    max_tokens: int,
+    encoding: tiktoken.Encoding,
+) -> tuple[str, int, int]:
     """Render the operation subgraph XML around an attributed operation.
 
     Args:
@@ -130,11 +176,10 @@ def _render_op_subgraph_xml(graph: ExecNetwork, op_id: str) -> str:
             The attributed operation identifier.
 
     Returns:
-        `str`:
-            The XML rendering of the attributed operation subgraph. When the
-            operation identifier cannot be resolved, an explanatory placeholder
-            is returned instead so the report agent still receives a usable
-            input.
+        `tuple[str, int, int]`:
+            The bounded XML rendering, original token count, and retained token
+            count. When the operation identifier cannot be resolved, an
+            explanatory placeholder is returned instead.
     """
     subgraph = graph.filter_by_operation(op_id)
     if subgraph.is_empty:
@@ -143,12 +188,22 @@ def _render_op_subgraph_xml(graph: ExecNetwork, op_id: str) -> str:
             "resolved to a subgraph in the provided execution graph.", 
             UserWarning,
         )
-        return (
+        placeholder = (
             f"(The attributed operation identifier '{op_id}' doesn't " 
             "exist in the provided execution graph. " 
             "This error attribution result is invalid.)"
         )
-    return subgraph.to_xml(include_metadata=False)
+        count = len(encoding.encode(placeholder))
+        return placeholder, count, count
+
+    bounded_xml, original_tokens = _truncate_tokens_around_marker(
+        subgraph.to_xml(include_metadata=False),
+        op_id,
+        max_tokens,
+        encoding,
+    )
+    retained_tokens = len(encoding.encode(bounded_xml))
+    return bounded_xml, original_tokens, retained_tokens
 
 
 def _resolve_source_evidence_texts(
@@ -248,6 +303,15 @@ class ReportGenerationConfig(AgentBaseConfig):
         description="Number of failed cases provided as input to a single LLM call.",
         ge=1,
     )
+    max_op_xml_tokens: int = Field(
+        default=100_000,
+        description=(
+            "Maximum number of tokens retained from one attributed operation "
+            "subgraph XML. Oversized XML keeps the text nearest to the "
+            "attributed operation id."
+        ),
+        ge=1,
+    )
 
 
 class ErrorAnalysisReportRunner(AgentBaseRunner):
@@ -262,6 +326,7 @@ class ErrorAnalysisReportRunner(AgentBaseRunner):
                 provided, default configuration is used.
         """
         super().__init__(config or ReportGenerationConfig())
+        self._token_encoding = _get_token_encoding(self.config.model)
 
     def _build_agent(
         self,
@@ -393,9 +458,19 @@ class ErrorAnalysisReportRunner(AgentBaseRunner):
         if graphs_for_cases is not None:
             for index in range(n):
                 graph = graphs_for_cases[index]
-                op_xml = _render_op_subgraph_xml(
+                op_xml, original_tokens, retained_tokens = _render_op_subgraph_xml(
                     graph,
                     error_predictions[index].op_id,
+                    self.config.max_op_xml_tokens,
+                    self._token_encoding,
+                )
+                print(
+                    "[report] "
+                    f"case={index + 1} "
+                    f"op_id={error_predictions[index].op_id} "
+                    f"op_xml_tokens={original_tokens} "
+                    f"retained_op_xml_tokens={retained_tokens}",
+                    flush=True,
                 )
                 evidence = _resolve_source_evidence_texts(
                     failed_cases[index],
@@ -425,9 +500,21 @@ class ErrorAnalysisReportRunner(AgentBaseRunner):
             graph = ExecNetwork.import_graph(graph_data)
             try:
                 for index in indices:
-                    op_xml = _render_op_subgraph_xml(
-                        graph,
-                        error_predictions[index].op_id,
+                    op_xml, original_tokens, retained_tokens = (
+                        _render_op_subgraph_xml(
+                            graph,
+                            error_predictions[index].op_id,
+                            self.config.max_op_xml_tokens,
+                            self._token_encoding,
+                        )
+                    )
+                    print(
+                        "[report] "
+                        f"case={index + 1} "
+                        f"op_id={error_predictions[index].op_id} "
+                        f"op_xml_tokens={original_tokens} "
+                        f"retained_op_xml_tokens={retained_tokens}",
+                        flush=True,
                     )
                     evidence = _resolve_source_evidence_texts(
                         failed_cases[index],
@@ -571,6 +658,25 @@ class ErrorAnalysisReportRunner(AgentBaseRunner):
 
                     if batch_index == len(batch_starts) - 1:
                         prompt += "\n\nNOTE: This is the final batch of failed cases."
+
+                    current_report = (
+                        EMPTY_REPORT_PLACEHOLDER if report is None else report
+                    )
+                    report_tokens = len(
+                        self._token_encoding.encode(current_report),
+                    )
+                    prompt_tokens = len(self._token_encoding.encode(prompt))
+                    request_tokens = prompt_tokens + len(
+                        self._token_encoding.encode(sys_prompt),
+                    )
+                    print(
+                        "[report] "
+                        f"batch={batch_index + 1}/{len(batch_starts)} "
+                        f"current_report_tokens={report_tokens} "
+                        f"prompt_tokens={prompt_tokens} "
+                        f"request_text_tokens={request_tokens}",
+                        flush=True,
+                    )
 
                     api_key, base_url = api_pool.credential_for(batch_index)
                     agent = self._build_agent(
