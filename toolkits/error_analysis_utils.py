@@ -250,7 +250,7 @@ class ReportGenerationConfig(AgentBaseConfig):
         ge=1,
     )
     max_op_xml_tokens: int = Field(
-        default=300_000,
+        default=1_000_000,
         description=(
             "Maximum number of tokens retained from one attributed operation "
             "subgraph XML. Oversized XML keeps its last tokens."
