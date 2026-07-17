@@ -79,7 +79,11 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--exploration-strategy",
-        choices=["graph_search", "operation_block_search"],
+        choices=[
+            "graph_search",
+            "operation_block_search",
+            "long_context",
+        ],
         default="graph_search",
         help="The strategy used to explore the execution graph.",
     )
@@ -134,6 +138,16 @@ def parse_args() -> argparse.Namespace:
         help="Number of most recent messages kept uncompressed during compression.",
     )
     parser.add_argument(
+        "--full-log-token-limit",
+        type=int,
+        default=600_000,
+        help=(
+            "Token budget for the flattened execution trace. "
+            "It is truncated from the beginning so the latest operations can be kept. "
+            "Note that this parameter is only used for the long-context baseline."
+        ),
+    )
+    parser.add_argument(
         "--embedding-model-name",
         default="text-embedding-3-small",
         help="OpenAI-compatible embedding model name used for pseudo evidence retrieval.",
@@ -165,6 +179,19 @@ def parse_args() -> argparse.Namespace:
         choices=["sparse", "dense", "hybrid"],
         default="hybrid",
         help="Retrieval strategy used to select pseudo source-evidence starting points.",
+    )
+    parser.add_argument(
+        "--starting-point-query-type",
+        choices=[
+            "query_with_golden_answer",
+            "query_only",
+            "query_with_prediction",
+        ],
+        default="query_with_golden_answer",
+        help=(
+            "The case fields used to construct the pseudo source-evidence "
+            "starting-point retrieval query."
+        ),
     )
     parser.add_argument(
         "--num-starting-points",
@@ -260,6 +287,7 @@ async def run(args: argparse.Namespace) -> dict:
         api_config_path=args.api_config_path,
         context_window=args.context_window,
         max_context_limit=args.max_context_limit,
+        full_log_token_limit=args.full_log_token_limit,
         keep_recent=args.keep_recent,
         max_trace_nodes=args.max_trace_nodes,
         max_iters=args.max_iters,
@@ -269,6 +297,7 @@ async def run(args: argparse.Namespace) -> dict:
         embedding_api_key=args.embedding_api_key,
         embedding_batch_size=args.embedding_batch_size,
         retrieval_type=args.retrieval_type,
+        starting_point_query_type=args.starting_point_query_type,
         num_starting_points=args.num_starting_points,
         candidate_multiplier=args.candidate_multiplier,
         cache_dir=args.cache_dir,

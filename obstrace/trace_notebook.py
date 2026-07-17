@@ -10,6 +10,7 @@ from collections import defaultdict
 from collections.abc import Callable
 from typing import Any
 
+import tiktoken
 from agentscope.message import Msg, TextBlock
 from agentscope.module import StateModule
 from agentscope.tool import ToolResponse
@@ -79,8 +80,34 @@ def source_evidence_nodes_to_initial_focus(
     ]
 
 
-def flatten_execution_graph(network: ExecNetwork) -> str:
-    """Render an execution graph as a linear operation log."""
+def flatten_execution_graph(
+    network: ExecNetwork,
+    token_limit: int | None = None,
+) -> str:
+    """Render an execution graph as a linear operation log.
+
+    When a token limit is provided, complete operation blocks are selected from
+    newest to oldest until adding another block would exceed the budget. The
+    selected blocks are returned in chronological order.
+
+    Args:
+        network (`ExecNetwork`):
+            The execution network to render.
+        token_limit (`int | None`, optional):
+            Maximum number of tokens in the rendered operation blocks. If
+            omitted, all operations are rendered.
+
+    Returns:
+        `str`:
+            The flattened execution trace.
+
+    Raises:
+        `ValueError`:
+            If `token_limit` is not positive.
+    """
+    if token_limit is not None and token_limit <= 0:
+        raise ValueError("`token_limit` must be positive when provided.")
+
     ops = sorted(network.get_all_operations(), key=lambda op: (op.created_at, op.op_id))
     graph = network.to_runtime_graph()
     nodes_by_id = {node.full_node_id: node for node in graph.nodes}
@@ -92,13 +119,28 @@ def flatten_execution_graph(network: ExecNetwork) -> str:
         op_node_ids[edge.op_id].add(edge.target_full_node_id)
 
     rendered = []
-    for op in ops:
+    selected_token_count = 0
+    encoding = tiktoken.get_encoding("o200k_base") if token_limit else None
+
+    for op in reversed(ops):
         nodes = [
             nodes_by_id[node_id]
             for node_id in op_node_ids.get(op.op_id, set())
             if node_id in nodes_by_id
         ]
-        rendered.append(_format_operation(op, nodes, op_edges.get(op.op_id, [])))
+        operation_text = _format_operation(
+            op,
+            nodes,
+            op_edges.get(op.op_id, []),
+        )
+        if token_limit is not None:
+            operation_token_count = len(encoding.encode(operation_text))
+            if selected_token_count + operation_token_count > token_limit:
+                break
+            selected_token_count += operation_token_count
+        rendered.append(operation_text)
+
+    rendered.reverse()
     return "\n\n".join(rendered) or "[NO RELATED OPERATIONS FOUND]"
 
 

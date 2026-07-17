@@ -44,6 +44,7 @@
 
 ## News
 
+- **[2026-07-17]**: 🚀 We update the paper with a long-context baseline for error attribution and a no-attribution baseline for prompt optimization. We also release the code for studying query construction during starting-point initialization.
 - **[2026-06-09]**: 🚀 We open-source **MemTrace**, including the experiment code and the source code of the annotation interface.
 - **[2026-06-07]**: 🚀 We release the [**MemTraceBench**](https://huggingface.co/datasets/zjunlp/MemTraceBench) dataset, a benchmark for tracing and attributing failures in LLM memory systems, built from execution graphs and curated failure annotations.
 - **[2026-06-03]**: 🚀 [**MemBase**](https://github.com/zjunlp/MemBase) now integrates [**smartcomment**](https://github.com/zjunlp/smartcomment) to trace memory construction, retrieval, and usage. We also provide the [reproduction scripts and configs](https://github.com/zjunlp/MemBase/tree/main/examples/trace_memory_lifecycle_with_membase) for generating the execution-graph data used by **MemTraceBench**.
@@ -289,7 +290,9 @@ Useful options:
 - To use memory-system prior knowledge, add `--use-system-prior`.
 - To start from the annotated source evidence instead of retrieved pseudo evidence, use `--starting-nodes-type source_evidence`.
 - To use the search-based operation exploration strategy, set `--exploration-strategy operation_block_search`.
+- To run the long-context baseline, set `--exploration-strategy long_context`. If necessary, adjust `--full-log-token-limit` to fit the flattened execution trace within the model context window (default: `600000` tokens).
 - To change how MemTrace finds the initial evidence messages, set `--retrieval-type sparse`, `--retrieval-type dense`, or `--retrieval-type hybrid`. Use `--num-starting-points` to control how many starting evidence nodes are given to the agent, and `--candidate-multiplier` to let hybrid retrieval look at more candidates before selecting the final starting nodes.
+- To change the query used for starting-point retrieval, set `--starting-point-query-type`. The default, `query_with_golden_answer`, combines the question with its golden answer. To use the memory system's own prediction instead, set `--starting-point-query-type query_with_prediction`.
 - To change the attribution model, set `--model-name YOUR_MODEL_NAME`.
 - To switch memory systems, replace `evermemos` with one of `rag`, `mem0`, `evermemos`, or `long_context`.
 - For `mem0` and `long_context`, you can increase the maximum context limit with `--max-context-limit 1000000`.
@@ -387,6 +390,7 @@ Useful options:
 - To change how many memories are retrieved for each question during evaluation, set `--top-k N`.
 - To control concurrency, set `--qa-batch-size`, `--judge-batch-size`, `--attribution-batch-size`, or `--optimization-batch-size`.
 - To include more previous optimization feedback, set `--num-gradient-histories N`.
+- To run the prompt-optimization baseline without MemTrace, add `--disable-memtrace`. This assigns every failed case uniformly as a response error to all optimizable prompt targets.
 - To restart from scratch instead of resuming, add `--rerun`.
 
 ## Retrieval Performance
@@ -407,6 +411,7 @@ Useful options:
 
 - To evaluate another split, replace `rag` with `mem0`, `evermemos`, or `long_context`.
 - To compare different ways of finding evidence messages, set `--retrieval-type sparse`, `--retrieval-type dense`, or `--retrieval-type hybrid`.
+- To change the query used for starting-point retrieval, set `--starting-point-query-type`. The default, `query_with_golden_answer`, combines the question with its golden answer. Use `query_with_prediction` to combine the question with the memory system's prediction, or `query_only` to use only the question.
 - To decide how many retrieved evidence messages count when computing recall@k, set `--k N`.
 - To let hybrid retrieval inspect more candidate messages before returning the final results, set `--candidate-multiplier N`.
 - To change embedding throughput, set `--embedding-batch-size N`.

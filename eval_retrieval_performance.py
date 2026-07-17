@@ -42,6 +42,16 @@ def parse_args() -> argparse.Namespace:
         help="The retrieval strategy used to select starting points.",
     )
     parser.add_argument(
+        "--starting-point-query-type",
+        choices=[
+            "query_with_golden_answer",
+            "query_only",
+            "query_with_prediction",
+        ],
+        default="query_with_golden_answer",
+        help="The case fields used to construct the starting-point retrieval query.",
+    )
+    parser.add_argument(
         "--candidate-multiplier",
         type=int,
         default=2,
@@ -168,7 +178,12 @@ async def run(args: argparse.Namespace) -> None:
         )
         await retriever.add_documents(documents)
 
-        query = f"{case.query}\n{case.golden_answer}"
+        if args.starting_point_query_type == "query_only":
+            query = case.query
+        elif args.starting_point_query_type == "query_with_prediction":
+            query = f"{case.query}\n{case.prediction}"
+        else:
+            query = f"{case.query}\n{case.golden_answer}"
         docs = await retriever.retrieve(query, limit=args.k)
 
         datasets.append(graph.metadata["memtracebench_dataset_source"])

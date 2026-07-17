@@ -12,6 +12,7 @@ from pydantic import (
     Field,
     JsonValue,
 )
+from agentscope.agent import ReActAgent
 from agentscope.embedding import OpenAITextEmbedding
 from agentscope.formatter import OpenAIChatFormatter
 from agentscope.message import Msg, TextBlock
@@ -30,7 +31,11 @@ from graphtrace import (
     StudioServer,
     agentscope_token_monitor,
 )
-from obstrace import CCTraceNotebook, ObsTraceAttributionAgent
+from obstrace import (
+    CCTraceNotebook,
+    ObsTraceAttributionAgent,
+    flatten_execution_graph,
+)
 from smartcomment.runtime import ExecNetwork
 from smartcomment.runtime.variable import RuntimeVariable
 from .bench_utils import FailedQueryCase
@@ -198,6 +203,27 @@ Golden answer:
 Model's wrong answer:
 {prediction}
 """,
+    "long_context": """You are performing failure attribution for a memory-based question-answering system.
+
+The execution trace is provided below. Note that the provided source-evidence list contains multiple evidence items, some of which may be irrelevant to the question. During failure attribution, you should independently assess the validity and relevance of each item.
+
+{instructions}
+
+Question:
+{question}
+
+Golden answer:
+{golden_answer}
+
+Model's wrong answer:
+{prediction}
+
+Source evidence:
+{source_evidence_text}
+
+Execution trace:
+{execution_trace}
+""",
     "with_source_evidence_initial_nodes": """You are performing failure attribution for a memory-based question-answering system.
 
 The execution graph has already been initialized with the query node and the source-evidence message nodes in the exploration frontier.
@@ -286,7 +312,11 @@ class ErrorAttributionPrediction(BaseModel):
 class MemTraceConfig(AgentBaseConfig):
     """The configuration for MemTrace."""
 
-    exploration_strategy: Literal["graph_search", "operation_block_search"] = Field(
+    exploration_strategy: Literal[
+        "graph_search",
+        "operation_block_search",
+        "long_context",
+    ] = Field(
         default="graph_search",
         description="The strategy used to explore the execution graph.",
     )
@@ -302,6 +332,15 @@ class MemTraceConfig(AgentBaseConfig):
             "memory compression in the agent. It prevents the messages to be "
             "compressed from exceeding the model's context window, which would "
             "otherwise make the compression request itself overflow the context."
+        ),
+        ge=1,
+    )
+    full_log_token_limit: int = Field(
+        default=600_000,
+        description=(
+            "Token budget for the flattened execution trace. "
+            "It is truncated from the beginning so the latest operations can be kept. "
+            "Note that this parameter is only used for the long-context baseline."
         ),
         ge=1,
     )
@@ -358,6 +397,17 @@ class MemTraceConfig(AgentBaseConfig):
         description=(
             "The retrieval strategy used to select pseudo source-evidence "
             "starting points when real source evidence is not provided."
+        ),
+    )
+    starting_point_query_type: Literal[
+        "query_with_golden_answer",
+        "query_only",
+        "query_with_prediction",
+    ] = Field(
+        default="query_with_golden_answer",
+        description=(
+            "The case fields used to construct the retrieval query for pseudo "
+            "source-evidence starting points."
         ),
     )
     num_starting_points: int | None = Field(
@@ -930,6 +980,42 @@ class MemTraceRunner(AgentBaseRunner):
             ),
         )
 
+    def _build_long_context_agent(
+        self,
+        api_key: str,
+        base_url: str,
+    ) -> ReActAgent:
+        """Build a long-context attribution agent without trace tools.
+
+        Args:
+            api_key (`str`):
+                OpenAI-compatible API key.
+            base_url (`str`):
+                OpenAI-compatible base URL.
+
+        Returns:
+            `ReActAgent`:
+                Configured long-context attribution agent.
+        """
+        cfg = self.config
+        model = OpenAIChatModel(
+            model_name=cfg.model,
+            api_key=api_key,
+            stream=cfg.stream,
+            client_kwargs={"base_url": base_url},
+            generate_kwargs={"temperature": cfg.temperature},
+        )
+        return ReActAgent(
+            name="memtrace",
+            sys_prompt=(
+                "You are a careful execution-trace failure attribution agent. "
+                "Inspect the complete execution trace before answering."
+            ),
+            model=model,
+            formatter=OpenAIChatFormatter(),
+            max_iters=cfg.max_iters,
+        )
+
     def _build_task_prompt(
         self,
         case: FailedQueryCase,
@@ -938,6 +1024,7 @@ class MemTraceRunner(AgentBaseRunner):
         is_pseudo_source_evidence: bool = False,
         memory_system: str | None = None, 
         custom_prior_knowledge: str | None = None,
+        execution_trace: str | None = None,
     ) -> str:
         """Build the attribution task prompt for one failed case.
 
@@ -960,6 +1047,9 @@ class MemTraceRunner(AgentBaseRunner):
             custom_prior_knowledge (`str | None`, optional):
                 Custom prior knowledge. If it is provided, it will be included in 
                 the prompt.
+            execution_trace (`str | None`, optional):
+                Flattened execution trace included by the long-context
+                attribution strategy.
 
         Returns:
             `str`:
@@ -971,6 +1061,22 @@ class MemTraceRunner(AgentBaseRunner):
                 question=case.query,
                 golden_answer=case.golden_answer,
                 prediction=case.prediction,
+            )
+
+        if self.config.exploration_strategy == "long_context":
+            if execution_trace is None:
+                raise ValueError(
+                    "`execution_trace` is required for the long-context strategy."
+                )
+            return TASK_PROMPT_TEMPLATES["long_context"].format(
+                instructions=OBS_ATTRIBUTION_INSTRUCTIONS,
+                question=case.query,
+                golden_answer=case.golden_answer,
+                prediction=case.prediction,
+                source_evidence_text=_format_source_evidence(
+                    source_evidence_nodes or []
+                ),
+                execution_trace=execution_trace,
             )
 
         instructions = ATTRIBUTION_INSTRUCTIONS
@@ -1058,7 +1164,12 @@ class MemTraceRunner(AgentBaseRunner):
             if cfg.num_starting_points is not None
             else cfg.max_trace_nodes // 2
         )
-        query = f"{case.query}\n{case.golden_answer}"
+        if cfg.starting_point_query_type == "query_only":
+            query = case.query
+        elif cfg.starting_point_query_type == "query_with_prediction":
+            query = f"{case.query}\n{case.prediction}"
+        else:
+            query = f"{case.query}\n{case.golden_answer}"
         retrieved = await retriever.retrieve(query, limit=num_starting_points)
         return [graph.get_variable(doc.metadata.doc_id) for doc in retrieved]
 
@@ -1172,10 +1283,12 @@ class MemTraceRunner(AgentBaseRunner):
                         "max_context_limit",
                         "keep_recent",
                         "max_trace_nodes",
+                        "full_log_token_limit", 
                         "max_iters",
                         "embedding_model_name",
                         "embedding_dimensions",
                         "retrieval_type",
+                        "starting_point_query_type",
                         "num_starting_points",
                         "candidate_multiplier",
                     )
@@ -1218,6 +1331,7 @@ class MemTraceRunner(AgentBaseRunner):
                     source_evidence_nodes = None
 
                 api_key, base_url = api_pool.credential_for(case_index)
+                execution_trace = None
                 if self.config.exploration_strategy == "operation_block_search":
                     notebook = CCTraceNotebook.from_graph(
                         graph,
@@ -1228,6 +1342,9 @@ class MemTraceRunner(AgentBaseRunner):
                         api_key=api_key,
                         base_url=base_url,
                     )
+                elif self.config.exploration_strategy == "long_context":
+                    execution_trace = flatten_execution_graph(graph, token_limit=self.config.full_log_token_limit)
+                    agent = self._build_long_context_agent(api_key=api_key, base_url=base_url)
                 else:
                     notebook = GraphTraceNotebook(
                         graph,
@@ -1256,6 +1373,7 @@ class MemTraceRunner(AgentBaseRunner):
                         is_pseudo_source_evidence=is_pseudo_source_evidence,
                         memory_system=memory_system,
                         custom_prior_knowledge=custom_prior_knowledge,
+                        execution_trace=execution_trace,
                     ),
                     "user",
                 )
