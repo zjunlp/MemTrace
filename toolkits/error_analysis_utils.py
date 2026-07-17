@@ -5,6 +5,7 @@ import os
 import warnings
 from collections import defaultdict
 from pathlib import Path
+import tiktoken
 from pydantic import BaseModel, Field
 from agentscope.agent import ReActAgent
 from agentscope.formatter import OpenAIChatFormatter
@@ -248,6 +249,14 @@ class ReportGenerationConfig(AgentBaseConfig):
         description="Number of failed cases provided as input to a single LLM call.",
         ge=1,
     )
+    max_op_xml_tokens: int = Field(
+        default=1_000_000,
+        description=(
+            "Maximum number of tokens retained from one attributed operation "
+            "subgraph XML. Oversized XML keeps its last tokens."
+        ),
+        ge=1,
+    )
 
 
 class ErrorAnalysisReportRunner(AgentBaseRunner):
@@ -262,6 +271,7 @@ class ErrorAnalysisReportRunner(AgentBaseRunner):
                 provided, default configuration is used.
         """
         super().__init__(config or ReportGenerationConfig())
+        self._token_encoding = tiktoken.get_encoding("o200k_base")
 
     def _build_agent(
         self,
@@ -397,6 +407,11 @@ class ErrorAnalysisReportRunner(AgentBaseRunner):
                     graph,
                     error_predictions[index].op_id,
                 )
+                op_xml_tokens = self._token_encoding.encode(op_xml)
+                if len(op_xml_tokens) > self.config.max_op_xml_tokens:
+                    op_xml = self._token_encoding.decode(
+                        op_xml_tokens[-self.config.max_op_xml_tokens:],
+                    )
                 evidence = _resolve_source_evidence_texts(
                     failed_cases[index],
                     graph,
@@ -429,6 +444,11 @@ class ErrorAnalysisReportRunner(AgentBaseRunner):
                         graph,
                         error_predictions[index].op_id,
                     )
+                    op_xml_tokens = self._token_encoding.encode(op_xml)
+                    if len(op_xml_tokens) > self.config.max_op_xml_tokens:
+                        op_xml = self._token_encoding.decode(
+                            op_xml_tokens[-self.config.max_op_xml_tokens:],
+                        )
                     evidence = _resolve_source_evidence_texts(
                         failed_cases[index],
                         graph,
